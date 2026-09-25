@@ -78,6 +78,8 @@ class PublicSchoolSummary:
     practice_ratio: float
     match_ratio: float
     pending_makeup: int
+    # 聚合所依据的方案版本（与班级覆盖、教研异常同源，保证视图一致）
+    plan_versions: tuple[int, ...] = ()
     note: str = ""
 
 
@@ -96,12 +98,16 @@ def build_public_summary(
         if (case := review_cases.get(cid)) is None
         or case.status in (ReviewStatus.CLEARED, ReviewStatus.MAKEUP_ORDERED)
     }
+    plan_versions = tuple(sorted({
+        v for cov in counted.values() for v in cov.plan_versions
+    }))
     n = len(counted)
     if n < PUBLIC_MIN_CLASSES:
         return PublicSchoolSummary(
             school_id=school_id, published=False, classes_counted=n,
             occasions_completed_ratio=0.0, skill_taught_ratio=0.0,
             practice_ratio=0.0, match_ratio=0.0, pending_makeup=0,
+            plan_versions=plan_versions,
             note=f"计入班级不足 {PUBLIC_MIN_CLASSES} 个，按最小聚合规则抑制发布",
         )
 
@@ -123,6 +129,7 @@ def build_public_summary(
         match_ratio=round(match / len(skills), 3) if skills else 0.0,
         # 单元格抑制：待补赛场次过少时不报具体数，防止反推单一班级
         pending_makeup=pending if pending >= PUBLIC_MIN_CELL else 0,
+        plan_versions=plan_versions,
     )
     return summary
 
@@ -133,7 +140,9 @@ class ParentView:
 
     student_label: str  # 不回传真实学号，仅回传“本人子女”语义标签
     adaptations: tuple
-    recent_minutes: tuple  # (occasion_key, minutes, mode)
+    recent_minutes: tuple  # (occasion_key, minutes, mode, plan_version)
+    # 该子女记录核对所引用的方案版本，与班级覆盖/公众聚合同源
+    plan_versions: tuple[int, ...] = ()
 
 
 def build_parent_view(
@@ -149,14 +158,24 @@ def build_parent_view(
     adaptations = tuple(
         a for a in adaptations_by_student.get(student_id, ())
     )
-    # 只返回该生经确认场次的时长；未确认场次不展示结论，避免先入为主
-    minutes = tuple(
-        (s.occasion.key(), s.per_student.get(token, 0), s.mode.value)
-        for s in sessions
+    # 只返回该生经确认场次的时长；未确认场次不展示结论，避免先入为主。
+    # 每条携带当时生效方案版本，家长看到的依据与教研、公众完全一致。
+    confirmed = [
+        s for s in sessions
         if s.confirmed and token in s.per_student
+    ]
+    minutes = tuple(
+        (s.occasion.key(), s.per_student.get(token, 0), s.mode.value,
+         getattr(s, "plan_version", None))
+        for s in confirmed
     )
+    plan_versions = tuple(sorted({
+        s.plan_version for s in confirmed
+        if getattr(s, "plan_version", None) is not None
+    }))
     return ParentView(
         student_label="本人子女",
         adaptations=adaptations,
         recent_minutes=minutes,
+        plan_versions=plan_versions,
     )

@@ -14,6 +14,7 @@
 from .models import (
     ActivityKind,
     InjuryAdaptation,
+    LedgerPosition,
     PlanSlot,
     SemesterPlan,
     SkillGoal,
@@ -25,6 +26,7 @@ from .models import (
 __all__ = [
     "ActivityKind",
     "InjuryAdaptation",
+    "LedgerPosition",
     "PlanSlot",
     "SemesterPlan",
     "SkillGoal",

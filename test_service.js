@@ -2,7 +2,7 @@
 
 const { spawnSync } = require("node:child_process");
 
-const modules = ["service_contract", "test_pe_domain"];
+const modules = ["service_contract", "test_pe_domain", "test_plan_versions"];
 let failed = false;
 for (const mod of modules) {
   const result = spawnSync("python3", ["-m", "unittest", "-v", mod], { stdio: "inherit" });

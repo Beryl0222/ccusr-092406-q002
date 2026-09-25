@@ -144,12 +144,35 @@ class PlanSlot:
             raise ValueError("班级人数必须为正数")
 
 
+@dataclass(frozen=True, order=True)
+class LedgerPosition:
+    """账本中的可比较位置。
+
+    排序键是事件的“实际发生位置” (at)，迟到上传时它可以早于接收序号；
+    seq 为同分（同位置）时的确定性次序（接收序号）。
+    任何版本生效判断都基于位置而不是内存对象或调用时机，
+    因此账本乱序重放与服务恢复后得到相同的版本选择。
+    """
+
+    at: int
+    seq: int = 0
+
+
 @dataclass(frozen=True)
 class SemesterPlan:
     """学期方案（带版本）。
 
     版本由 plans 模块在提交时统一编号；frozen 版本进入审批后只读，
     任何调整必须以新版本承载，旧版本永久保留以便对照“阴阳课表”。
+
+    三个可比较的账本位置固定版本的生效时点：
+
+    - ``submitted_at``  提交位置：收到方案但尚未批准，不能用于核对事件；
+    - ``approved_at``   批准位置：自此位置起该版本可用于核对；
+    - ``superseded_at`` 取代位置：新版本批准时写入；自此位置起旧版失效。
+
+    每个事件只能引用“在该事件实际发生位置已经批准、且尚未被新版本替代”
+    的版本；较晚的批准绝不回写更早的结论（见 plans.PlanRegistry）。
     """
 
     school_id: str
@@ -159,9 +182,24 @@ class SemesterPlan:
     skill_goals: tuple[SkillGoal, ...]
     status: str = "draft"  # draft / submitted / approved / superseded
     submitted_by: Optional[str] = None
+    submitted_at: Optional[LedgerPosition] = None
+    approved_at: Optional[LedgerPosition] = None
+    superseded_at: Optional[LedgerPosition] = None
 
     def with_status(self, **changes) -> "SemesterPlan":
         return replace(self, **changes)
 
     def slots_for(self, class_id: str) -> tuple[PlanSlot, ...]:
         return tuple(s for s in self.slots if s.class_id == class_id)
+
+    def effective_at(self, pos: LedgerPosition) -> bool:
+        """该版本在位置 ``pos`` 是否“已批准且尚未被替代”。
+
+        批准间隙（已提交未批准）与取代生效后均不生效；边界取批准/取代
+        事件本身所在位置（同位置批准可用于同位置事件，取代自取代位置起失效）。
+        """
+        return (
+            self.approved_at is not None
+            and self.approved_at <= pos
+            and (self.superseded_at is None or pos < self.superseded_at)
+        )

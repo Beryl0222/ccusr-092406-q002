@@ -49,6 +49,9 @@ class ClassCoverage:
     pending_makeup: int
     in_review: int
     skill_coverage: tuple[SkillCoverage, ...]
+    # 本班核对所引用的当时生效方案版本（家长视图/公众聚合/教研异常共用同一来源）
+    plan_versions: tuple[int, ...] = ()
+    unverified: int = 0  # 当时无生效方案的场次（不计入任何分母，也不判缺口）
 
     @property
     def completion_ratio(self) -> float:
@@ -123,20 +126,38 @@ def compute_class_coverage(
     rebuilt: dict,
     skill_goals,
 ) -> ClassCoverage:
-    """rebuilt 为 ledger.rebuild_class() 的输出。"""
+    """rebuilt 为 ledger.rebuild_class() 的输出。
+
+    无生效方案（批准之前/批准间隙）的场次不计入分母、不判缺口、不产生技能
+    覆盖；版本化重放时班级覆盖率携带当时生效的方案版本集合，供三视图共用。
+    """
     states = rebuilt["states"]
-    planned_occasions = {k: {"state": v} for k, v in states.items()}
+    uncovered = set(rebuilt.get("uncovered", ()))
+    versioned = rebuilt.get("versioned", False)
+    scoped_states = {
+        k: v for k, v in states.items()
+        if k not in uncovered
+    }
+    planned_occasions = {k: {"state": v} for k, v in scoped_states.items()}
     completed = sum(1 for v in planned_occasions.values() if v["state"] == "completed")
     pending = sum(
         1 for v in planned_occasions.values()
         if v["state"] in ("taken_over", "missing", "weather_pending")
     )
     in_review = sum(1 for v in planned_occasions.values() if v["state"] == "in_review")
-    sessions = [s for s in rebuilt["sessions"] if s.confirmed]
+    # 无版本可核对的确认场次不授予任何技能覆盖
+    sessions = [
+        s for s in rebuilt["sessions"]
+        if s.confirmed and (not versioned or s.plan_version is not None)
+    ]
     skill_cov = tuple(
         compute_skill_coverage(goal, sessions)
         for goal in skill_goals
     )
+    basis = rebuilt.get("basis_versions", {})
+    plan_versions = tuple(sorted({
+        ver for ver in basis.values() if ver is not None
+    }))
     return ClassCoverage(
         class_id=class_id,
         total_occasions=len(planned_occasions),
@@ -144,4 +165,6 @@ def compute_class_coverage(
         pending_makeup=pending,
         in_review=in_review,
         skill_coverage=skill_cov,
+        plan_versions=plan_versions,
+        unverified=len(uncovered),
     )

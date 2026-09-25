@@ -56,10 +56,17 @@ def pseudonym(student_id: str, semester_salt: str) -> str:
 
 @dataclass(frozen=True)
 class Occasion:
-    """一个排定时段在某一周的具体场次。"""
+    """一个排定时段在某一周的具体场次。
+
+    ``at`` 是该场次在账本位置轴上的**实际发生位置**（与方案提交/批准/取代
+    共用同一可比较坐标）。迟到上传时接收序号更晚，但 ``at`` 仍是实际发生点，
+    版本选择与三方确认都按它而不是接收顺序匹配。生产中由教学周历换算，
+    现阶段以逻辑序号占位。
+    """
 
     slot_id: str
     week: int
+    at: int = 0
 
     def key(self) -> str:
         return f"{self.slot_id}#w{self.week}"

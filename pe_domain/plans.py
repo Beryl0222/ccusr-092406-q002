@@ -11,13 +11,22 @@
 7. 室外时段必须给出降雨与高温替代，且替代场地为室内、容量足够。
 
 校验不通过返回结构化问题清单，由学校修改后重新提交，不产生任何处罚记录。
+
+版本生效时点（修复“用后批准的第二版核对第一版期间课程”）：
+
+- 提交、批准、取代三类版本事件都写入账本，各自带可比较的 ``LedgerPosition``
+  （实际发生位置 at + 同位置次序 seq），与授课事件共用同一排序空间；
+- 任一事件只能引用“在该事件实际发生位置已经批准、且尚未被新版本替代”的版本
+  （``effective_on``），批准间隙内的事件无版本可引用，记为 uncovered 而非异常；
+- 较晚的批准/取代绝不改变更早位置上的版本选择，因此迟到上传（at 早于接收序号）
+  与账本乱序重放、服务恢复重放得到完全相同的版本选择。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import ActivityKind, SemesterPlan, Venue, VenueType
+from .models import ActivityKind, LedgerPosition, SemesterPlan, Venue, VenueType
 
 
 @dataclass(frozen=True)
@@ -133,13 +142,71 @@ def validate_plan(
 class PlanRegistry:
     """方案版本库：提交即分配递增版本号，批准后冻结，修订生成新版本。
 
-    旧版本永不删除——识别“阴阳课表”时需要把实际授课事件与当时生效的
+    旧版本永不删除——识别“阴阳课表”时需要把实际授课事件与**当时生效**的
     批准版本逐条对照。
+
+    生效时点完全由账本位置决定：版本库通过账本登记 ``plan_submitted`` /
+    ``plan_approved`` 事件（取代在新版本批准的同一事务内登记），恢复时
+    只重放这些事件即可重建同样的状态，乱序/迟到/重启结果一致。
     """
 
-    def __init__(self):
-        self._plans: dict[tuple[str, str], list[SemesterPlan]] = {}
+    SUBMIT_EVENT = "plan_submitted"
+    APPROVE_EVENT = "plan_approved"
 
+    def __init__(self, ledger=None):
+        self._plans: dict[tuple[str, str], list[SemesterPlan]] = {}
+        self._ledger = ledger
+        if ledger is not None:
+            self._restore(ledger)
+
+    # ------------------------------------------------------------------
+    # 从账本恢复：只追加事件重放，得到与在线登记完全一致的版本状态
+    # ------------------------------------------------------------------
+    def _restore(self, ledger) -> None:
+        for entry in ledger.entries():
+            p = entry.payload
+            if not isinstance(p, dict) or p.get("kind") not in (
+                self.SUBMIT_EVENT, self.APPROVE_EVENT
+            ):
+                continue
+            # 位置以账本条目为准：迟到登记的方案事件 at 可能早于接收序号
+            if p["kind"] == self.SUBMIT_EVENT:
+                self._ingest_submit(p["plan"], entry.position)
+            else:
+                self._ingest_approve(
+                    p["school_id"], p["semester"], p["version"], entry.position
+                )
+
+    def _ingest_submit(self, plan: SemesterPlan, pos: LedgerPosition) -> SemesterPlan:
+        key = (plan.school_id, plan.semester)
+        history = self._plans.setdefault(key, [])
+        if plan.version != len(history) + 1:
+            raise ValueError(
+                f"版本号必须连续提交：收到 v{plan.version}，下一应为 v{len(history) + 1}"
+            )
+        submitted = plan.with_status(
+            status="submitted", submitted_at=pos,
+            approved_at=None, superseded_at=None,
+        )
+        history.append(submitted)
+        return submitted
+
+    def _ingest_approve(
+        self, school_id: str, semester: str, version: int, pos: LedgerPosition
+    ) -> SemesterPlan:
+        history = self._plans[(school_id, semester)]
+        idx = version - 1
+        plan = history[idx]
+        approved = plan.with_status(status="approved", approved_at=pos)
+        history[idx] = approved
+        # 仅取代“当前批准中”的版本；早已 superseded 的版本保留其原取代位置，
+        # 多次取代后每个版本的生效区间仍是 [approved_at, superseded_at)。
+        for i, older in enumerate(history):
+            if i != idx and older.status == "approved":
+                history[i] = older.with_status(status="superseded", superseded_at=pos)
+        return approved
+
+    # ------------------------------------------------------------------
     def submit(
         self,
         plan: SemesterPlan,
@@ -147,6 +214,7 @@ class PlanRegistry:
         teachers: dict,
         *,
         submitted_by: str,
+        at: int | None = None,
     ) -> SemesterPlan:
         issues = validate_plan(plan, venues, teachers)
         if issues:
@@ -154,21 +222,41 @@ class PlanRegistry:
         key = (plan.school_id, plan.semester)
         history = self._plans.setdefault(key, [])
         version = len(history) + 1
-        submitted = plan.with_status(version=version, status="submitted", submitted_by=submitted_by)
-        history.append(submitted)
-        return submitted
+        numbered = plan.with_status(
+            version=version, submitted_by=submitted_by,
+            submitted_at=None, approved_at=None, superseded_at=None,
+        )
+        if self._ledger is None:
+            return self._ingest_submit(numbered, LedgerPosition(at if at is not None else version, version))
+        entry = self._ledger.append_plan_event(
+            self.SUBMIT_EVENT,
+            {"kind": self.SUBMIT_EVENT, "plan": numbered},
+            at=at,
+        )
+        return self._ingest_submit(numbered, entry.position)
 
-    def approve(self, school_id: str, semester: str, version: int) -> SemesterPlan:
-        plan = self.get(school_id, semester, version)
-        idx = self._plans[(school_id, semester)].index(plan)
-        approved = plan.with_status(status="approved")
-        history = self._plans[(school_id, semester)]
-        history[idx] = approved
-        # 旧批准版本标记为 superseded
-        for i, older in enumerate(history):
-            if i != idx and older.status == "approved":
-                history[i] = older.with_status(status="superseded")
-        return approved
+    def approve(
+        self,
+        school_id: str,
+        semester: str,
+        version: int,
+        *,
+        at: int | None = None,
+    ) -> SemesterPlan:
+        # 先确认版本存在且可批准
+        self.get(school_id, semester, version)
+        if self._ledger is None:
+            return self._ingest_approve(
+                school_id, semester, version,
+                LedgerPosition(at if at is not None else version, version),
+            )
+        entry = self._ledger.append_plan_event(
+            self.APPROVE_EVENT,
+            {"kind": self.APPROVE_EVENT, "school_id": school_id,
+             "semester": semester, "version": version},
+            at=at,
+        )
+        return self._ingest_approve(school_id, semester, version, entry.position)
 
     def get(self, school_id: str, semester: str, version: int | None = None) -> SemesterPlan:
         history = self._plans[(school_id, semester)]
@@ -179,16 +267,71 @@ class PlanRegistry:
             raise ValueError("该学期尚无已批准方案")
         return history[version - 1]
 
-    def effective_on(self, school_id: str, semester: str, *, at_index: int) -> SemesterPlan:
-        """返回某次提交序号之前已批准的版本（事件对照用）。
+    def effective_on(
+        self, school_id: str, semester: str, at: int | LedgerPosition
+    ) -> SemesterPlan:
+        """返回在位置 ``at`` “当时已批准且尚未被替代”的方案版本。
 
-        at_index 为账本事件序号；真实系统中改用事件时间戳。
+        ``at`` 可为整数（实际发生位置）或 ``LedgerPosition``。
+        批准间隙（尚未有任何批准）或在最早版本批准之前抛错，由调用方
+        记为“当时无生效方案”，绝不退而使用最新版本。
         """
-        history = self._plans[(school_id, semester)]
-        approved = [p for p in history if p.status in ("approved", "superseded")]
-        if not approved:
-            raise ValueError("当时无生效方案")
-        return approved[-1]
+        pos = at if isinstance(at, LedgerPosition) else LedgerPosition(at, at)
+        history = self._plans.get((school_id, semester), [])
+        effective = [p for p in history if p.effective_at(pos)]
+        if not effective:
+            raise ValueError("当时无已批准且未被替代的生效方案")
+        # 同一位置不应有两个生效版本（取代是半开区间）；取最高版本兜底确定性
+        return max(effective, key=lambda p: p.version)
+
+    def effective_version_at(
+        self, school_id: str, semester: str, at: int | LedgerPosition
+    ) -> int | None:
+        """与 effective_on 相同的选择，返回版本号；无生效版本时返回 None。"""
+        try:
+            return self.effective_on(school_id, semester, at).version
+        except ValueError:
+            return None
 
     def history(self, school_id: str, semester: str) -> tuple[SemesterPlan, ...]:
         return tuple(self._plans.get((school_id, semester), []))
+
+    # ------------------------------------------------------------------
+    # 修订影响分析：只标记受影响区间，供有选择地重算
+    # ------------------------------------------------------------------
+    def revision_impact(
+        self, school_id: str, semester: str, new_version: int
+    ) -> dict:
+        """比较相邻两版，返回影响场地/教师/场地应急替代/技能目标的槽位。
+
+        仅这些槽位对应、且发生在新版本生效区间内的场次需要重算；
+        未变化的槽位与新版本生效前的历史场次沿用旧版依据。
+        """
+        history = self._plans[(school_id, semester)]
+        if not 2 <= new_version <= len(history):
+            raise ValueError("只能与上一版比较修订影响")
+        old = {s.slot_id: s for s in history[new_version - 2].slots}
+        new = {s.slot_id: s for s in history[new_version - 1].slots}
+        changed: dict[str, tuple[str, ...]] = {}
+        for slot_id in sorted(set(old) | set(new)):
+            dims: list[str] = []
+            o, n = old.get(slot_id), new.get(slot_id)
+            if o is None or n is None:
+                dims.append("slot_added" if o is None else "slot_removed")
+            else:
+                if n.venue_id != o.venue_id:
+                    dims.append("venue")
+                if n.teacher_id != o.teacher_id:
+                    dims.append("teacher")
+                if n.weather_alternatives != o.weather_alternatives:
+                    dims.append("weather_alternative")
+                if n.skill_code != o.skill_code:
+                    dims.append("skill")
+            if dims:
+                changed[slot_id] = tuple(dims)
+        new_plan = history[new_version - 1]
+        return {
+            "version": new_version,
+            "effective_at": new_plan.approved_at,
+            "changed_slots": changed,
+        }
