@@ -17,7 +17,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import ActivityKind, SemesterPlan, Venue, VenueType
+from .models import ActivityKind, LedgerPosition, SemesterPlan, Venue, VenueType
+
+
+class NoApprovedPlanAtPosition(LookupError):
+    """给定账本位置之前（或当时）该学期尚无已批准且未被取代的方案。
+
+    这是“批准间隙”的正常领域结果：早期事件不能被后来才批准的版本回写核对，
+    这些场次标记为“当时无生效方案”，不计阴阳课表异常。
+    """
 
 
 @dataclass(frozen=True)
@@ -130,11 +138,69 @@ def validate_plan(
     return issues
 
 
+# ---------------------------------------------------------------- 版本影响面
+#
+# 方案修订可能改变四类核对依据：场地、教师、场地应急替代（降雨/高温）、
+# 技能目标。只有处于修订影响区间（新版本生效起）且命中受影响 slot 的场次
+# 才需要重算；历史场次维持原版本核对。
+
+_AFFECTED_FIELDS = ("venue_id", "teacher_id", "skill_code", "weather_alternatives")
+
+
+def affected_slots(old: SemesterPlan, new: SemesterPlan) -> frozenset[str]:
+    """返回新旧版本间四类依据发生变化的 slot_id 集合（按 slot_id 对齐）。
+
+    版本间 slot 可能增删：新增 slot 影响其自身（新场次自新版本起才存在）；
+    删除 slot 同样返回其 id——它在新版本中不再是计划场次，重算时由版本
+    绑定规则自然排除（事件仍按发生时的旧版本核对）。
+    """
+    old_by_id = {s.slot_id: s for s in old.slots}
+    new_by_id = {s.slot_id: s for s in new.slots}
+    changed: set[str] = set()
+    for slot_id in sorted(set(old_by_id) | set(new_by_id)):
+        o = old_by_id.get(slot_id)
+        n = new_by_id.get(slot_id)
+        if o is None or n is None:
+            changed.add(slot_id)  # 新增 / 删除
+            continue
+        if any(getattr(o, f) != getattr(n, f) for f in _AFFECTED_FIELDS):
+            changed.add(slot_id)
+    return frozenset(changed)
+
+
+def affected_dimensions(old: SemesterPlan, new: SemesterPlan) -> frozenset[str]:
+    """受影响的依据维度名称（venue/teacher/weather_alt/skill）。"""
+    old_by_id = {s.slot_id: s for s in old.slots}
+    new_by_id = {s.slot_id: s for s in new.slots}
+    dims: set[str] = set()
+    for slot_id in set(old_by_id) & set(new_by_id):
+        o, n = old_by_id[slot_id], new_by_id[slot_id]
+        if o.venue_id != n.venue_id:
+            dims.add("venue")
+        if o.teacher_id != n.teacher_id:
+            dims.add("teacher")
+        if o.weather_alternatives != n.weather_alternatives:
+            dims.add("weather_alt")
+        if o.skill_code != n.skill_code:
+            dims.add("skill")
+    # slot 增删可能同时牵动四个维度，保守标记
+    if set(old_by_id) != set(new_by_id):
+        dims.update(("venue", "teacher", "weather_alt", "skill"))
+    return frozenset(dims)
+
+
 class PlanRegistry:
     """方案版本库：提交即分配递增版本号，批准后冻结，修订生成新版本。
 
-    旧版本永不删除——识别“阴阳课表”时需要把实际授课事件与当时生效的
-    批准版本逐条对照。
+    旧版本永不删除——识别“阴阳课表”时需要把实际授课事件与**当时生效的**
+    批准版本逐条对照。提交、批准、取代三个动作各自记录可比较的账本位置
+    （``LedgerPosition``），因此：
+
+    - 同一学期任一事件只能引用“当时已批准且尚未被新版本替代”的版本
+      （``version_effective_at``）；
+    - 较晚批准不改变早期版本的生效区间，早期结论不被回写；
+    - 乱序重放/服务恢复只需按相同位置序列重建（``from_journal``），
+      版本选择必然一致。
     """
 
     def __init__(self):
@@ -147,6 +213,7 @@ class PlanRegistry:
         teachers: dict,
         *,
         submitted_by: str,
+        at: LedgerPosition | None = None,
     ) -> SemesterPlan:
         issues = validate_plan(plan, venues, teachers)
         if issues:
@@ -154,20 +221,35 @@ class PlanRegistry:
         key = (plan.school_id, plan.semester)
         history = self._plans.setdefault(key, [])
         version = len(history) + 1
-        submitted = plan.with_status(version=version, status="submitted", submitted_by=submitted_by)
+        submitted = plan.with_status(
+            version=version,
+            status="submitted",
+            submitted_by=submitted_by,
+            submitted_at=at,
+        )
         history.append(submitted)
         return submitted
 
-    def approve(self, school_id: str, semester: str, version: int) -> SemesterPlan:
+    def approve(
+        self,
+        school_id: str,
+        semester: str,
+        version: int,
+        *,
+        at: LedgerPosition | None = None,
+    ) -> SemesterPlan:
         plan = self.get(school_id, semester, version)
+        if plan.status not in ("submitted",):
+            raise ValueError(f"版本 {version} 当前状态 {plan.status}，不可批准")
         idx = self._plans[(school_id, semester)].index(plan)
-        approved = plan.with_status(status="approved")
+        approved = plan.with_status(status="approved", approved_at=at)
         history = self._plans[(school_id, semester)]
         history[idx] = approved
-        # 旧批准版本标记为 superseded
+        # 新批准版本的批准位置，就是此前生效版本被取代的位置（同刻）：
+        # 取代点开区间，故同刻的业务事件已引用新版本。
         for i, older in enumerate(history):
             if i != idx and older.status == "approved":
-                history[i] = older.with_status(status="superseded")
+                history[i] = older.with_status(status="superseded", superseded_at=at)
         return approved
 
     def get(self, school_id: str, semester: str, version: int | None = None) -> SemesterPlan:
@@ -179,16 +261,124 @@ class PlanRegistry:
             raise ValueError("该学期尚无已批准方案")
         return history[version - 1]
 
-    def effective_on(self, school_id: str, semester: str, *, at_index: int) -> SemesterPlan:
-        """返回某次提交序号之前已批准的版本（事件对照用）。
+    def version_effective_at(
+        self,
+        school_id: str,
+        semester: str,
+        position: LedgerPosition,
+    ) -> SemesterPlan:
+        """返回该位置“当时已批准且尚未被新版本替代”的唯一方案版本。
 
-        at_index 为账本事件序号；真实系统中改用事件时间戳。
+        审批间隙（首个版本批准之前 / 旧版本已被取代而新版本尚未批准的
+        情形不会发生——取代与新批准同刻）抛 ``NoApprovedPlanAtPosition``。
         """
-        history = self._plans[(school_id, semester)]
-        approved = [p for p in history if p.status in ("approved", "superseded")]
-        if not approved:
-            raise ValueError("当时无生效方案")
-        return approved[-1]
+        history = self._plans.get((school_id, semester), [])
+        candidates = [p for p in history if p.effective_at(position)]
+        if not candidates:
+            raise NoApprovedPlanAtPosition(
+                f"{school_id}/{semester} 在位置 {position.occurred_at} 无已批准且未被取代的方案"
+            )
+        # 区间互不重叠；若理论上重叠，取版本号最大者，保证选择确定
+        return max(candidates, key=lambda p: p.version)
+
+    def effective_on(self, school_id: str, semester: str, *, at_index: int) -> SemesterPlan:
+        """兼容旧调用：按账本序号选择当时已批准且未被取代的版本。
+
+        新代码应使用 :meth:`version_effective_at`（按发生位置而非序号）。
+        """
+        history = self._plans.get((school_id, semester), [])
+        candidates = [
+            p for p in history
+            if p.approved_at is not None and p.approved_at.seq <= at_index
+            and (p.superseded_at is None or p.superseded_at.seq > at_index)
+        ]
+        if not candidates:
+            raise NoApprovedPlanAtPosition(f"序号 {at_index} 前无已批准且未被取代的方案")
+        return max(candidates, key=lambda p: p.version)
+
+    def timeline(self, school_id: str, semester: str) -> tuple[tuple[LedgerPosition, str, int], ...]:
+        """该学期全部版本动作的位置时间线：(位置, 动作, 版本)。
+
+        动作为 submitted / approved / superseded，按位置全序排列，
+        供重放、审计与测试核对。
+        """
+        events: list[tuple[LedgerPosition, str, int]] = []
+        for p in self._plans.get((school_id, semester), []):
+            if p.submitted_at is not None:
+                events.append((p.submitted_at, "submitted", p.version))
+            if p.approved_at is not None:
+                events.append((p.approved_at, "approved", p.version))
+            if p.superseded_at is not None:
+                events.append((p.superseded_at, "superseded", p.version))
+        return tuple(sorted(events, key=lambda e: LedgerPosition.sort_key(e[0])))
 
     def history(self, school_id: str, semester: str) -> tuple[SemesterPlan, ...]:
         return tuple(self._plans.get((school_id, semester), []))
+
+    # ------------------------------------------------------------------
+    def journal(self) -> tuple[dict, ...]:
+        """导出版本库的只追加动作流（提交/批准），用于服务恢复。
+
+        取代位置由相邻批准确定性派生，不单独入流——回放结果与导出前
+        逐字节一致（superseded_at == 新版本的 approved_at）。
+        """
+        records: list[dict] = []
+        for key in sorted(self._plans):
+            school_id, semester = key
+            for p in self._plans[key]:
+                if p.submitted_at is not None:
+                    records.append({
+                        "type": "plan_submitted",
+                        "school_id": school_id,
+                        "semester": semester,
+                        "version": p.version,
+                        "plan": p,
+                        "submitted_by": p.submitted_by,
+                    })
+                if p.approved_at is not None:
+                    records.append({
+                        "type": "plan_approved",
+                        "school_id": school_id,
+                        "semester": semester,
+                        "version": p.version,
+                        "approved_at": p.approved_at,
+                    })
+        def _key(rec):
+            plan = rec.get("plan")
+            pos = plan.submitted_at if rec["type"] == "plan_submitted" else rec["approved_at"]
+            return LedgerPosition.sort_key(pos)
+        return tuple(sorted(records, key=_key))
+
+    @classmethod
+    def from_journal(
+        cls,
+        records,
+        venues: dict[str, Venue],
+        teachers: dict,
+    ) -> "PlanRegistry":
+        """按动作流重建版本库；重放顺序与位置由记录携带，不依赖接收顺序。"""
+        registry = cls()
+        ordered = sorted(
+            records,
+            key=lambda r: LedgerPosition.sort_key(
+                r["plan"].submitted_at if r["type"] == "plan_submitted" else r["approved_at"]
+            ),
+        )
+        for rec in ordered:
+            if rec["type"] == "plan_submitted":
+                plan = rec["plan"]
+                registry.submit(
+                    plan.with_status(status="draft", submitted_at=None,
+                                     approved_at=None, superseded_at=None),
+                    venues, teachers,
+                    submitted_by=rec["submitted_by"],
+                    at=plan.submitted_at,
+                )
+            elif rec["type"] == "plan_approved":
+                registry.approve(
+                    rec["school_id"], rec["semester"], rec["version"],
+                    at=rec["approved_at"],
+                )
+            else:
+                raise ValueError(f"未知版本动作：{rec['type']}")
+        return registry

@@ -144,12 +144,46 @@ class PlanSlot:
             raise ValueError("班级人数必须为正数")
 
 
+@dataclass(frozen=True, order=True)
+class LedgerPosition:
+    """可比较的账本位置。
+
+    业务事件必须回答两个不同的问题：
+
+    - **什么时候发生**（occurred_at）：迟到上传的离线事件，发生位置仍是实际
+      授课时刻，而不是服务器接收时刻（received_at 只用于离线受理时限判断）；
+    - **处在账本什么位置**（seq）：重放乱序到达、服务恢复后按账本重放时的
+      稳定全序依据。seq 按 occurred_at 分配，同刻由 phase 决定先后
+      （方案提交 → 方案批准 → 业务事件），保证“同一位置”边界确定。
+
+    seq 必须严格递增、无空洞地覆盖重放集合；运行时协调层在回放/恢复时
+    重编号，使乱序重放与服务恢复得到完全相同的版本选择。
+    """
+
+    seq: int
+    occurred_at: str
+    phase: int = 2  # 0=plan_submitted 1=plan_approved 2=业务事件
+
+    @staticmethod
+    def sort_key(position: "LedgerPosition") -> tuple:
+        return (position.occurred_at, position.phase, position.seq)
+
+
 @dataclass(frozen=True)
 class SemesterPlan:
     """学期方案（带版本）。
 
     版本由 plans 模块在提交时统一编号；frozen 版本进入审批后只读，
     任何调整必须以新版本承载，旧版本永久保留以便对照“阴阳课表”。
+
+    三个账本位置是版本生效时点的唯一依据：
+
+    - submitted_at：提交位置（已入库但尚未批准，不能核对任何事件）；
+    - approved_at：生效起点（闭区间）；
+    - superseded_at：被新版本取代的位置（开区间）。版本 v 对满足
+      ``approved_at <= 事件位置 < superseded_at`` 的事件生效。
+      ``None`` 表示仍在生效。较晚批准的版本只影响取代点之后的事件，
+      绝不回写早期核对结论。
     """
 
     school_id: str
@@ -159,9 +193,27 @@ class SemesterPlan:
     skill_goals: tuple[SkillGoal, ...]
     status: str = "draft"  # draft / submitted / approved / superseded
     submitted_by: Optional[str] = None
+    submitted_at: Optional[LedgerPosition] = None
+    approved_at: Optional[LedgerPosition] = None
+    superseded_at: Optional[LedgerPosition] = None
 
     def with_status(self, **changes) -> "SemesterPlan":
         return replace(self, **changes)
 
     def slots_for(self, class_id: str) -> tuple[PlanSlot, ...]:
         return tuple(s for s in self.slots if s.class_id == class_id)
+
+    def effective_at(self, position: LedgerPosition) -> bool:
+        """该版本在给定账本位置是否为“已批准且尚未被取代”。
+
+        边界：批准同刻的业务事件（phase=2）在批准（phase=1）之后，引用本版本；
+        取代同刻的业务事件在新批准之后，应引用新版本——故取代点开区间。
+        """
+        if self.approved_at is None:
+            return False
+        if LedgerPosition.sort_key(position) < LedgerPosition.sort_key(self.approved_at):
+            return False
+        if self.superseded_at is not None and \
+                LedgerPosition.sort_key(position) >= LedgerPosition.sort_key(self.superseded_at):
+            return False
+        return True

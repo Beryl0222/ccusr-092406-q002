@@ -39,6 +39,7 @@ class SkillCoverage:
     matched_ratio: float
     evidence: tuple[str, ...]     # 命中的场次 key
     gaps: tuple[str, ...]         # 可解释缺口
+    plan_version: int = 0         # 本行依据的方案版本（0=传统单版口径）
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class ClassCoverage:
     pending_makeup: int
     in_review: int
     skill_coverage: tuple[SkillCoverage, ...]
+    plan_versions: tuple[int, ...] = ()  # 本班核对实际引用过的方案版本
 
     @property
     def completion_ratio(self) -> float:
@@ -59,11 +61,14 @@ def _week_of(occasion_key: str) -> int:
     return int(occasion_key.rsplit("w", 1)[1])
 
 
-def compute_skill_coverage(goal, confirmed_sessions, *, rescheduled_weeks=None):
+def compute_skill_coverage(goal, confirmed_sessions, *, rescheduled_weeks=None,
+                           plan_version: int = 0):
     """confirmed_sessions: ledger 重建后的已确认会话列表（对象含 occasion/taught_skill/mode/kind）。
 
     rescheduled_weeks: 调课生效后，原 slot 在某周改期的集合（视为该周仍有安排），
     用于避免把合规调课误判为缺口。
+    plan_version: 本行核对所依据的方案版本；会话须绑定同一版本
+    （版本化重放时由 compute_class_coverage 按版本分组后传入）。
     """
     rescheduled_weeks = rescheduled_weeks or set()
     evidence: list[str] = []
@@ -115,6 +120,7 @@ def compute_skill_coverage(goal, confirmed_sessions, *, rescheduled_weeks=None):
         matched_ratio=min(1.0, round(matched / matched_planned, 3)) if matched_planned else 1.0,
         evidence=tuple(sorted(evidence)),
         gaps=tuple(gaps),
+        plan_version=plan_version,
     )
 
 
@@ -123,25 +129,65 @@ def compute_class_coverage(
     rebuilt: dict,
     skill_goals,
 ) -> ClassCoverage:
-    """rebuilt 为 ledger.rebuild_class() 的输出。"""
+    """rebuilt 为 ledger 重放输出。
+
+    skill_goals 支持两种口径：
+
+    - tuple：传统单版模式，全部会话按同一组目标核对（plan_version=0）；
+    - dict{version: goals}：版本化模式，每个会话只按其绑定版本的目标核对，
+      跨版本的同名技能各自成行，保证与家长视图、教研异常引用同一版本。
+    """
     states = rebuilt["states"]
-    planned_occasions = {k: {"state": v} for k, v in states.items()}
-    completed = sum(1 for v in planned_occasions.values() if v["state"] == "completed")
+    planned_occasions = {
+        k: v for k, v in states.items() if v != "no_plan"
+    }  # 批准间隙（无生效方案）的场次不计入计划分母
+    completed = sum(1 for v in planned_occasions.values() if v == "completed")
     pending = sum(
         1 for v in planned_occasions.values()
-        if v["state"] in ("taken_over", "missing", "weather_pending")
+        if v in ("taken_over", "missing", "weather_pending")
     )
-    in_review = sum(1 for v in planned_occasions.values() if v["state"] == "in_review")
-    sessions = [s for s in rebuilt["sessions"] if s.confirmed]
-    skill_cov = tuple(
-        compute_skill_coverage(goal, sessions)
-        for goal in skill_goals
-    )
+    in_review = sum(1 for v in planned_occasions.values() if v == "in_review")
+    confirmed_sessions = [s for s in rebuilt["sessions"] if s.confirmed]
+    versions_by_occasion = rebuilt.get("plan_versions", {})
+
+    skill_rows: list[SkillCoverage] = []
+    versions_used: set[int] = set()
+    if isinstance(skill_goals, dict):
+        def original_version(session) -> int:
+            if session.mode == SessionMode.MAKEUP and session.makeup_for is not None:
+                return versions_by_occasion.get(session.makeup_for.key(), 0)
+            return 0
+
+        for version in sorted(skill_goals):
+            sessions_v = []
+            for s in confirmed_sessions:
+                orig_v = original_version(s)
+                if orig_v:
+                    # 补课只归入原场次版本的口径，不在补课发生的新版本重复计分
+                    if orig_v == version:
+                        sessions_v.append(s)
+                elif versions_by_occasion.get(s.occasion.key()) == version:
+                    sessions_v.append(s)
+            for goal in skill_goals[version]:
+                skill_rows.append(compute_skill_coverage(
+                    goal, sessions_v, plan_version=version,
+                ))
+            if sessions_v:
+                versions_used.add(version)
+    else:
+        skill_rows = [
+            compute_skill_coverage(goal, confirmed_sessions)
+            for goal in skill_goals
+        ]
+
     return ClassCoverage(
         class_id=class_id,
         total_occasions=len(planned_occasions),
         completed=completed,
         pending_makeup=pending,
         in_review=in_review,
-        skill_coverage=skill_cov,
+        skill_coverage=tuple(skill_rows),
+        plan_versions=tuple(sorted(
+            set(versions_by_occasion.values()) | versions_used
+        )),
     )

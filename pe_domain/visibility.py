@@ -78,6 +78,7 @@ class PublicSchoolSummary:
     practice_ratio: float
     match_ratio: float
     pending_makeup: int
+    plan_versions: tuple[int, ...] = ()  # 聚合实际引用的方案版本（口径可追溯）
     note: str = ""
 
 
@@ -96,12 +97,16 @@ def build_public_summary(
         if (case := review_cases.get(cid)) is None
         or case.status in (ReviewStatus.CLEARED, ReviewStatus.MAKEUP_ORDERED)
     }
+    versions = tuple(sorted({
+        v for cov in counted.values() for v in getattr(cov, "plan_versions", ())
+    }))
     n = len(counted)
     if n < PUBLIC_MIN_CLASSES:
         return PublicSchoolSummary(
             school_id=school_id, published=False, classes_counted=n,
             occasions_completed_ratio=0.0, skill_taught_ratio=0.0,
             practice_ratio=0.0, match_ratio=0.0, pending_makeup=0,
+            plan_versions=versions,
             note=f"计入班级不足 {PUBLIC_MIN_CLASSES} 个，按最小聚合规则抑制发布",
         )
 
@@ -123,6 +128,7 @@ def build_public_summary(
         match_ratio=round(match / len(skills), 3) if skills else 0.0,
         # 单元格抑制：待补赛场次过少时不报具体数，防止反推单一班级
         pending_makeup=pending if pending >= PUBLIC_MIN_CELL else 0,
+        plan_versions=versions,
     )
     return summary
 
@@ -133,7 +139,7 @@ class ParentView:
 
     student_label: str  # 不回传真实学号，仅回传“本人子女”语义标签
     adaptations: tuple
-    recent_minutes: tuple  # (occasion_key, minutes, mode)
+    recent_minutes: tuple  # (occasion_key, minutes, mode, plan_version)
 
 
 def build_parent_view(
@@ -142,7 +148,11 @@ def build_parent_view(
     adaptations_by_student: dict,
     sessions,
 ) -> ParentView:
-    """家长视图。凭据无效直接 AccessDenied。"""
+    """家长视图。凭据无效直接 AccessDenied。
+
+    每条分钟记录携带核对所引用的方案版本，与班级覆盖率、教研异常
+    使用同一次版本化重放的结果，家长看到的“这节课怎么算的”可对上版本。
+    """
     student_id = vault.resolve_parent(parent_credential)
     token = vault.token_for(student_id)
 
@@ -151,7 +161,8 @@ def build_parent_view(
     )
     # 只返回该生经确认场次的时长；未确认场次不展示结论，避免先入为主
     minutes = tuple(
-        (s.occasion.key(), s.per_student.get(token, 0), s.mode.value)
+        (s.occasion.key(), s.per_student.get(token, 0), s.mode.value,
+         getattr(s, "plan_version", 0))
         for s in sessions
         if s.confirmed and token in s.per_student
     )
